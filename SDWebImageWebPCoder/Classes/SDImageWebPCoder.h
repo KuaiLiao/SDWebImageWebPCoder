@@ -12,6 +12,18 @@
 @import SDWebImage;
 #endif
 
+NS_ASSUME_NONNULL_BEGIN
+
+@interface SDImageWebpResult : NSObject
+
+@property (nonatomic, strong) NSArray<UIImage *> *images;
+
+@property (nonatomic, assign) NSTimeInterval duration;
+
++ (instancetype)createWithImages:(NSArray<UIImage *> *)images duration:(NSTimeInterval)duration;
+
+@end
+
 /**
  Built in coder that supports WebP and animated WebP
  */
@@ -19,4 +31,8 @@
 
 @property (nonatomic, class, readonly, nonnull) SDImageWebPCoder *sharedCoder;
 
+- (SDImageWebpResult *_Nullable)decodedAniImagesWithData:(NSData *)data options:(SDImageCoderOptions * _Nullable)options;
+
 @end
+
+NS_ASSUME_NONNULL_END

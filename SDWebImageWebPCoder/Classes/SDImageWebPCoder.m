@@ -136,6 +136,17 @@ WEBP_CSP_MODE ConvertCSPMode(CGBitmapInfo bitmapInfo) {
     return MODE_LAST;
 }
 
+@implementation SDImageWebpResult
+
++ (instancetype)createWithImages:(NSArray<UIImage *> *_Nonnull)images duration:(NSTimeInterval)duration {
+    SDImageWebpResult *result = [SDImageWebpResult new];
+    result.images = images;
+    result.duration = duration;
+    return result;
+}
+
+@end
+
 @interface SDWebPCoderFrame : NSObject
 
 @property (nonatomic, assign) NSUInteger index; // Frame index (zero based)
@@ -213,6 +224,183 @@ WEBP_CSP_MODE ConvertCSPMode(CGBitmapInfo bitmapInfo) {
 - (BOOL)canIncrementalDecodeFromData:(NSData *)data {
     return ([NSData sd_imageFormatForImageData:data] == SDImageFormatWebP);
 }
+
+- (SDImageWebpResult *)decodedAniImagesWithData:(NSData *)data options:(nullable SDImageCoderOptions *)options {
+    if (!data) {
+        return nil;
+    }
+    
+    WebPData webpData;
+    WebPDataInit(&webpData);
+    webpData.bytes = data.bytes;
+    webpData.size = data.length;
+    WebPDemuxer *demuxer = WebPDemux(&webpData);
+    if (!demuxer) {
+        return nil;
+    }
+    
+    uint32_t flags = WebPDemuxGetI(demuxer, WEBP_FF_FORMAT_FLAGS);
+    BOOL hasAnimation = flags & ANIMATION_FLAG;
+    BOOL decodeFirstFrame = [options[SDImageCoderDecodeFirstFrameOnly] boolValue];
+    CGFloat scale = 1;
+    NSNumber *scaleFactor = options[SDImageCoderDecodeScaleFactor];
+    if (scaleFactor != nil) {
+        scale = [scaleFactor doubleValue];
+        if (scale < 1) {
+            scale = 1;
+        }
+    }
+    
+    CGSize thumbnailSize = CGSizeZero;
+    NSValue *thumbnailSizeValue = options[SDImageCoderDecodeThumbnailPixelSize];
+    if (thumbnailSizeValue != nil) {
+#if SD_MAC
+        thumbnailSize = thumbnailSizeValue.sizeValue;
+#else
+        thumbnailSize = thumbnailSizeValue.CGSizeValue;
+#endif
+    }
+    
+    BOOL preserveAspectRatio = YES;
+    NSNumber *preserveAspectRatioValue = options[SDImageCoderDecodePreserveAspectRatio];
+    if (preserveAspectRatioValue != nil) {
+        preserveAspectRatio = preserveAspectRatioValue.boolValue;
+    }
+    
+    // for animated webp image
+    WebPIterator iter;
+    // libwebp's index start with 1
+    if (!WebPDemuxGetFrame(demuxer, 1, &iter)) {
+        WebPDemuxReleaseIterator(&iter);
+        WebPDemuxDelete(demuxer);
+        return nil;
+    }
+    CGColorSpaceRef colorSpace = [self sd_createColorSpaceWithDemuxer:demuxer];
+    int canvasWidth = WebPDemuxGetI(demuxer, WEBP_FF_CANVAS_WIDTH);
+    int canvasHeight = WebPDemuxGetI(demuxer, WEBP_FF_CANVAS_HEIGHT);
+    uint32_t frameCount = WebPDemuxGetI(demuxer, WEBP_FF_FRAME_COUNT);
+    int loopCount = WebPDemuxGetI(demuxer, WEBP_FF_LOOP_COUNT);
+    
+    NSUInteger limitBytes = 0;
+    NSNumber *limitBytesValue = options[SDImageCoderDecodeScaleDownLimitBytes];
+    if (limitBytesValue != nil) {
+        limitBytes = limitBytesValue.unsignedIntegerValue;
+    }
+    // Scale down to limit bytes if need
+    if (limitBytes > 0) {
+        // Hack 32 BitsPerPixel
+        CGSize imageSize = CGSizeMake(canvasWidth, canvasHeight);
+        CGSize framePixelSize = [SDImageCoderHelper scaledSizeWithImageSize:imageSize limitBytes:limitBytes bytesPerPixel:4 frameCount:frameCount];
+        // Override thumbnail size
+        thumbnailSize = framePixelSize;
+        preserveAspectRatio = YES;
+    }
+    
+    // Check whether we need to use thumbnail
+    CGSize scaledSize = [SDImageCoderHelper scaledSizeWithImageSize:CGSizeMake(canvasWidth, canvasHeight) scaleSize:thumbnailSize preserveAspectRatio:preserveAspectRatio shouldScaleUp:NO];
+    
+    if (!hasAnimation || decodeFirstFrame) {
+        // first frame for animated webp image
+        CGImageRef imageRef = [self sd_createWebpImageWithData:iter.fragment colorSpace:colorSpace scaledSize:scaledSize];
+        CGColorSpaceRelease(colorSpace);
+#if SD_UIKIT || SD_WATCH
+        UIImage *firstFrameImage = [[UIImage alloc] initWithCGImage:imageRef scale:scale orientation:UIImageOrientationUp];
+#else
+        UIImage *firstFrameImage = [[UIImage alloc] initWithCGImage:imageRef scale:scale orientation:kCGImagePropertyOrientationUp];
+#endif
+        firstFrameImage.sd_imageFormat = SDImageFormatWebP;
+        CGImageRelease(imageRef);
+        WebPDemuxReleaseIterator(&iter);
+        WebPDemuxDelete(demuxer);
+        return [SDImageWebpResult createWithImages:@[firstFrameImage] duration:0];
+    }
+    
+    BOOL hasAlpha = flags & ALPHA_FLAG;
+    CGContextRef canvas = CreateWebPCanvas(hasAlpha, CGSizeMake(canvasWidth, canvasHeight), thumbnailSize, preserveAspectRatio);
+    if (!canvas) {
+        WebPDemuxDelete(demuxer);
+        CGColorSpaceRelease(colorSpace);
+        return nil;
+    }
+    
+    NSMutableArray<SDImageFrame *> *frames = [NSMutableArray array];
+    
+    do {
+        @autoreleasepool {
+            CGImageRef imageRef = [self sd_drawnWebpImageWithCanvas:canvas demuxer:demuxer iterator:iter colorSpace:colorSpace];
+            if (!imageRef) {
+                continue;
+            }
+
+#if SD_UIKIT || SD_WATCH
+            UIImage *image = [[UIImage alloc] initWithCGImage:imageRef scale:scale orientation:UIImageOrientationUp];
+#else
+            UIImage *image = [[UIImage alloc] initWithCGImage:imageRef scale:scale orientation:kCGImagePropertyOrientationUp];
+#endif
+            CGImageRelease(imageRef);
+            
+            NSTimeInterval duration = [self sd_frameDurationWithIterator:iter];
+            SDImageFrame *frame = [SDImageFrame frameWithImage:image duration:duration];
+            [frames addObject:frame];
+        }
+        
+    } while (WebPDemuxNextFrame(&iter));
+    
+    WebPDemuxReleaseIterator(&iter);
+    WebPDemuxDelete(demuxer);
+    CGContextRelease(canvas);
+    CGColorSpaceRelease(colorSpace);
+    
+    return [SDImageWebPCoder animatedImageWithFrames:frames];
+}
+
+#if SD_UIKIT || SD_WATCH
+static NSUInteger gcd(NSUInteger a, NSUInteger b) {
+    NSUInteger c;
+    while (a != 0) {
+        c = a;
+        a = b % a;
+        b = c;
+    }
+    return b;
+}
+
+static NSUInteger gcdArray(size_t const count, NSUInteger const * const values) {
+    if (count == 0) {
+        return 0;
+    }
+    NSUInteger result = values[0];
+    for (size_t i = 1; i < count; ++i) {
+        result = gcd(values[i], result);
+    }
+    return result;
+}
+
++ (SDImageWebpResult *)animatedImageWithFrames:(NSArray<SDImageFrame *> *)frames {
+    NSUInteger frameCount = frames.count;
+    if (frameCount == 0) {
+        return nil;
+    }
+    
+    NSUInteger durations[frameCount];
+    for (size_t i = 0; i < frameCount; i++) {
+        durations[i] = frames[i].duration * 1000;
+    }
+    NSUInteger const gcd = gcdArray(frameCount, durations);
+    __block NSTimeInterval totalDuration = 0;
+    NSMutableArray<UIImage *> *animatedImages = [NSMutableArray arrayWithCapacity:frameCount];
+    [frames enumerateObjectsUsingBlock:^(SDImageFrame * _Nonnull frame, NSUInteger idx, BOOL * _Nonnull stop) {
+        UIImage *image = frame.image;
+        NSUInteger duration = frame.duration * 1000;
+        totalDuration += frame.duration;
+        if (image) {
+            [animatedImages addObject:image];
+        }
+    }];
+    
+    return [SDImageWebpResult createWithImages:animatedImages duration:totalDuration] ;
+}
+#endif
 
 - (UIImage *)decodedImageWithData:(NSData *)data options:(nullable SDImageCoderOptions *)options {
     if (!data) {
