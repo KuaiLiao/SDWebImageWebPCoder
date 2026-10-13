@@ -354,7 +354,6 @@ WEBP_CSP_MODE ConvertCSPMode(CGBitmapInfo bitmapInfo) {
     return [SDImageWebPCoder animatedImageWithFrames:frames];
 }
 
-#if SD_UIKIT || SD_WATCH
 static NSUInteger gcd(NSUInteger a, NSUInteger b) {
     NSUInteger c;
     while (a != 0) {
@@ -400,7 +399,6 @@ static NSUInteger gcdArray(size_t const count, NSUInteger const * const values) 
     
     return [SDImageWebpResult createWithImages:animatedImages duration:totalDuration] ;
 }
-#endif
 
 - (UIImage *)decodedImageWithData:(NSData *)data options:(nullable SDImageCoderOptions *)options {
     if (!data) {
